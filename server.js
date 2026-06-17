@@ -164,6 +164,26 @@ Return ONLY a valid JSON object in this exact format:
   }
 });
 
+// POST /api/claude - direct proxy to the Anthropic Messages API
+app.post('/api/claude', async (req, res) => {
+  const { messages, system, max_tokens, model } = req.body;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages array is required' });
+  }
+  try {
+    const message = await client.messages.create({
+      model: model || MODEL,
+      max_tokens: Math.min(max_tokens || 2048, 4096),
+      system,
+      messages,
+    });
+    res.json(message);
+  } catch (err) {
+    console.error('/api/claude error:', err.message);
+    res.status(500).json({ error: 'Failed to call Anthropic API' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Lectio backend running on port ${PORT}`);
 });
