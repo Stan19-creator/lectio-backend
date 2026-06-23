@@ -183,7 +183,135 @@ app.post('/api/claude', async (req, res) => {
     res.status(500).json({ error: 'Failed to call Anthropic API' });
   }
 });
+// ─── POST /api/analyze — TradeVision (Vision + Web Search en parallèle) ───────
+app.post('/api/analyze', async (req, res) => {
+  const { image, mediaType, pair, timeframe, style, risk } = req.body;
+  if (!image || !mediaType) {
+    return res.status(400).json({ error: 'image et mediaType requis' });
+  }
 
+  const riskInstructions = {
+    Soft:   'SOFT: TP petit (+0.5% à +1.5%), SL serré (-0.3% à -0.6%), R/R 1:1.5.',
+    Medium: 'MEDIUM: TP modéré (+1.5% à +3%), SL normal (-0.8% à -1.5%), R/R 1:2.',
+    Hard:   'HARD: TP ambitieux (+3% à +8%), SL large (-1.5% à -3%), R/R 1:3.5.',
+  };
+
+  // APPEL 1 — Analyse technique du graphique (Claude Vision)
+  const chartPromise = client.messages.create({
+    model: MODEL,
+    max_tokens: 1000,
+    system: 'Tu es un analyste technique expert en trading. Retourne UNIQUEMENT du JSON valide sans markdown ni backticks.',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: image } },
+        {
+          type: 'text',
+          text: `Analyse ce graphique de trading.
+Paire: ${pair || 'inconnue'} | Timeframe: ${timeframe || '1H'} | Style: ${style || 'Swing Trading'}
+Niveau de risque: ${risk || 'Medium'} — ${riskInstructions[risk] || riskInstructions.Medium}
+
+Retourne UNIQUEMENT ce JSON :
+{"signal":"BUY","confidence":85,"summary":"texte","trend":"texte","support":"niveau","resistance":"niveau","take_profit":"niveau","stop_loss":"niveau","risk_reward":"1:2","indicators":["RSI","MACD"],"patterns":["pattern"],"technical_score":75,"warnings":"texte"}`,
+        },
+      ],
+    }],
+  });
+
+  // APPEL 2 — Actualités qui impactent la devise (Claude web search)
+  const newsPromise = client.messages.create({
+    model: MODEL,
+    max_tokens: 1000,
+    system: 'Tu es un analyste de marché financier. Retourne UNIQUEMENT du JSON valide sans markdown ni backticks.',
+    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+    messages: [{
+      role: 'user',
+      content: `Recherche les actualités économiques récentes qui impactent ${pair || 'les marchés financiers'} aujourd'hui. Cherche : banques centrales, NFP, CPI, inflation, taux, géopolitique.
+
+Retourne UNIQUEMENT ce JSON :
+{"fundamental_signal":"BULLISH","fundamental_score":70,"news":[{"title":"titre","impact":"POSITIF","detail":"explication impact sur ${pair || 'le marché'}"}],"macro_summary":"résumé 2-3 phrases","recommendation":"comment les fondamentaux confirment ou contredisent le signal technique"}`,
+    }],
+  });
+
+  try {
+    const [chartRes, newsRes] = await Promise.allSettled([chartPromise, newsPromise]);
+
+    // Parse analyse technique
+    let technical = null;
+    if (chartRes.status === 'fulfilled') {
+      try {
+        const text = chartRes.value.content?.[0]?.text || '';
+        const match = text.replace(/```json|```/g, '').match(/\{[\s\S]*\}/);
+        if (match) technical = JSON.parse(match[0]);
+      } catch (e) { console.error('Parse technical error:', e.message); }
+    }
+
+    // Parse fondamentaux (web search retourne tool_use + text)
+    let fundamental = null;
+    if (newsRes.status === 'fulfilled') {
+      try {
+        const blocks = newsRes.value.content || [];
+        const textBlock = blocks.find(b => b.type === 'text');
+        if (textBlock?.text) {
+          const match = textBlock.text.replace(/```json|```/g, '').match(/\{[\s\S]*\}/);
+          if (match) fundamental = JSON.parse(match[0]);
+        }
+      } catch (e) { console.error('Parse fundamental error:', e.message); }
+    }
+
+    if (!technical) {
+      return res.status(500).json({ error: "Impossible d'analyser le graphique" });
+    }
+
+    // Calcul du signal final combiné (55% technique / 45% fondamental)
+    let finalConfidence = technical.confidence || 50;
+    let warnings = technical.warnings || '';
+
+    if (fundamental) {
+      const techScore = technical.technical_score || technical.confidence || 50;
+      const fundScore = fundamental.fundamental_score || 50;
+      finalConfidence = Math.round(techScore * 0.55 + fundScore * 0.45);
+
+      const fundBullish = fundamental.fundamental_signal === 'BULLISH';
+      const fundBearish = fundamental.fundamental_signal === 'BEARISH';
+      const techBuy  = technical.signal === 'BUY';
+      const techSell = technical.signal === 'SELL';
+
+      if ((techBuy && fundBearish) || (techSell && fundBullish)) {
+        finalConfidence = Math.round(finalConfidence * 0.75);
+        warnings = `⚠️ Contradiction : le graphique indique ${technical.signal} mais les fondamentaux sont ${fundamental.fundamental_signal}. Prudence recommandée.`;
+      } else if ((techBuy && fundBullish) || (techSell && fundBearish)) {
+        finalConfidence = Math.min(97, Math.round(finalConfidence * 1.15));
+      }
+    }
+
+    return res.json({
+      signal:      technical.signal      || 'NEUTRE',
+      confidence:  finalConfidence,
+      summary:     technical.summary     || '',
+      trend:       technical.trend       || '',
+      support:     technical.support     || '',
+      resistance:  technical.resistance  || '',
+      take_profit: technical.take_profit || '',
+      stop_loss:   technical.stop_loss   || '',
+      risk_reward: technical.risk_reward || '',
+      indicators:  technical.indicators  || [],
+      patterns:    technical.patterns    || [],
+      warnings,
+      fundamental: fundamental ? {
+        signal:         fundamental.fundamental_signal,
+        score:          fundamental.fundamental_score,
+        summary:        fundamental.macro_summary,
+        recommendation: fundamental.recommendation,
+        news:           fundamental.news || [],
+      } : null,
+    });
+
+  } catch (err) {
+    console.error('/api/analyze error:', err.message);
+    return res.status(500).json({ error: err.message || 'Erreur serveur' });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Lectio backend running on port ${PORT}`);
 });
