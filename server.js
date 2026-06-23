@@ -10,7 +10,7 @@ const MODEL = 'claude-sonnet-4-6';
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
 // Helper: call Claude and parse JSON from the response
 async function callClaude(systemPrompt, userPrompt) {
